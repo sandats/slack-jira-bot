@@ -68,6 +68,20 @@ go test ./...                    # 全パッケージのテスト
 go build ./cmd/slack-jira-bot    # ビルド
 ```
 
+## CI
+
+GitHub Actions（[.github/workflows/ci.yml](.github/workflows/ci.yml)）と GitLab CI/CD（[.gitlab-ci.yml](.gitlab-ci.yml)）で、同じチェックを行います。片方を変えたら、もう片方も揃えてください。
+
+| ジョブ | 内容 |
+| --- | --- |
+| `test` | `gofmt` / `go mod tidy -diff` / `go vet` / `go test -race` / Linux 向けビルド |
+| `vulncheck` | `govulncheck` による既知の脆弱性のチェック |
+
+- GitHub Actions は `main` への push・Pull Request・週 1 回の定期実行で動きます。GitLab は MR・デフォルトブランチへの push と、「Build > Pipeline schedules」で設定した定期実行で動きます。
+- 依存関係（Go モジュール・GitHub Actions・Docker のベースイメージ）は Dependabot が週 1 回更新 PR を作ります（[.github/dependabot.yml](.github/dependabot.yml)）。
+- Go のバージョンは Dockerfile・両 CI の 3 か所で指定しています（Dependabot の対象外）。上げるときはまとめて更新してください。
+- 改行コードは [.gitattributes](.gitattributes) で LF に統一しています。
+
 ## 検証状況
 slack-go v0.30.1 + Go 1.27.2 で `go mod tidy` / `go vet` / `go build` / `go test` が通ることを確認済みです。
 実際の Slack ワークスペースとの結合動作（ショートカット、モーダル、メンション）は未確認です。
