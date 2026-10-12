@@ -1,7 +1,9 @@
 package jira
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -109,7 +111,7 @@ func TestCreateIssue_RequestAndErrors(t *testing.T) {
 		_, _ = w.Write([]byte(`{"key":"OPS-42"}`))
 	}, false)
 
-	key, err := j.CreateIssue(sampleInput())
+	key, err := j.CreateIssue(t.Context(), sampleInput())
 	if err != nil || key != "OPS-42" {
 		t.Fatalf("key=%q err=%v", key, err)
 	}
@@ -125,7 +127,7 @@ func TestCreateIssue_RequestAndErrors(t *testing.T) {
 		w.WriteHeader(400)
 		_, _ = w.Write([]byte(`{"errors":{"reporter":"Field 'reporter' cannot be set."}}`))
 	}, true)
-	_, err = j2.CreateIssue(sampleInput())
+	_, err = j2.CreateIssue(t.Context(), sampleInput())
 	if err == nil || !strings.HasPrefix(err.Error(), "400: ") || !strings.Contains(err.Error(), "reporter") {
 		t.Errorf("err = %v", err)
 	}
@@ -142,17 +144,17 @@ func TestAccountIDByEmail(t *testing.T) {
 	}
 
 	// 完全一致を優先（大文字小文字は区別しない）
-	id, _ := respond(`[{"accountId":"x","emailAddress":"other@example.com"},{"accountId":"y","emailAddress":"A@Example.com"}]`).AccountIDByEmail("a@example.com")
+	id, _ := respond(`[{"accountId":"x","emailAddress":"other@example.com"},{"accountId":"y","emailAddress":"A@Example.com"}]`).AccountIDByEmail(t.Context(), "a@example.com")
 	if id != "y" {
 		t.Errorf("exact match: %q", id)
 	}
 	// メール非公開で有効ユーザー 1 件
-	id, _ = respond(`[{"accountId":"z","active":true}]`).AccountIDByEmail("a@example.com")
+	id, _ = respond(`[{"accountId":"z","active":true}]`).AccountIDByEmail(t.Context(), "a@example.com")
 	if id != "z" {
 		t.Errorf("hidden email single: %q", id)
 	}
 	// 複数候補で一致なし → 採用しない
-	id, _ = respond(`[{"accountId":"p"},{"accountId":"q"}]`).AccountIDByEmail("a@example.com")
+	id, _ = respond(`[{"accountId":"p"},{"accountId":"q"}]`).AccountIDByEmail(t.Context(), "a@example.com")
 	if id != "" {
 		t.Errorf("ambiguous must be empty: %q", id)
 	}
@@ -168,7 +170,7 @@ func TestTransitionIssue(t *testing.T) {
 		w.WriteHeader(204)
 	}, false)
 
-	if err := j.TransitionIssue("OPS-1", "close"); err != nil {
+	if err := j.TransitionIssue(t.Context(), "OPS-1", "close"); err != nil {
 		t.Fatal(err)
 	}
 	if path != "/rest/api/3/issue/OPS-1/transitions" {
@@ -181,7 +183,7 @@ func TestTransitionIssue(t *testing.T) {
 		t.Errorf("resolution body: %v", body)
 	}
 	// 遷移 ID 未設定
-	if err := j.TransitionIssue("OPS-1", "cancel"); err == nil || !strings.Contains(err.Error(), "未設定") {
+	if err := j.TransitionIssue(t.Context(), "OPS-1", "cancel"); err == nil || !strings.Contains(err.Error(), "未設定") {
 		t.Errorf("unset transition err = %v", err)
 	}
 }
@@ -195,11 +197,42 @@ func TestAvailableTransitionsAndStatus(t *testing.T) {
 			_, _ = w.Write([]byte(`{"fields":{"status":{"name":"Closed"}}}`))
 		}
 	}, false)
-	got := j.AvailableTransitions("OPS-1")
+	got := j.AvailableTransitions(t.Context(), "OPS-1")
 	if len(got) != 2 || got[0] != "Close(id=31)" {
 		t.Errorf("transitions: %v", got)
 	}
-	if s := j.StatusName("OPS-1"); s != "Closed" {
+	if s := j.StatusName(t.Context(), "OPS-1"); s != "Closed" {
 		t.Errorf("status: %q", s)
+	}
+}
+
+// 通信エラーにリクエスト URL（cloudId を含む）が入らないこと
+func TestDo_NetworkErrorHidesURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL + "/ex/jira/secret-cloud-id"
+	srv.Close() // 接続できない状態にする
+
+	j := New(Config{APIBase: base})
+	_, err := j.CreateIssue(t.Context(), sampleInput())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "secret-cloud-id") || strings.Contains(err.Error(), srv.URL) {
+		t.Errorf("error must not contain the URL: %v", err)
+	}
+	if !strings.Contains(err.Error(), "POST /rest/api/3/issue") {
+		t.Errorf("error should contain method and path: %v", err)
+	}
+}
+
+// 呼び出し側の context がキャンセルされたらリクエストを中断すること
+func TestDo_ContextCanceled(t *testing.T) {
+	j := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}, false)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := j.CreateIssue(ctx, sampleInput()); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }

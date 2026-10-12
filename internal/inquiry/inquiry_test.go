@@ -51,6 +51,9 @@ func TestPickOptionAndDate(t *testing.T) {
 		"2026-02-30":    "", // 存在しない日付
 		"来週中":           "",
 		"期限 2026.12.1 ": "2026-12-01",
+		"２０２６／１０／２０":    "2026-10-20", // 全角数字
+		"20261020":      "2026-10-20",
+		"20260230":      "",
 	}
 	for in, want := range cases {
 		if got := ParseDate(in); got != want {
@@ -71,6 +74,9 @@ func TestParseCommand(t *testing.T) {
 		{"<@U0BOT> クローズ OPS-1", "close", "OPS-1", true},
 		{"<@U0BOT> close 123", "", "", false}, // プロジェクトキーなし
 		{"<@U0BOT> お願いします", "", "", false},
+		{"<@U0BOT> disclose OPS-1", "", "", false}, // 単語の途中にはマッチしない
+		{"<@U0BOT> 確認後にclose OPS-2", "close", "OPS-2", true},
+		{"<@U0BOT> 対応不要なのでキャンセル OPS-3", "cancel", "OPS-3", true},
 	}
 	for _, c := range cases {
 		a, k, ok := ParseCommand(c.in)
@@ -106,5 +112,47 @@ func TestFindRequesterID_Fallbacks(t *testing.T) {
 	}
 	if got := FindRequesterID(Message{User: "U0BOT", BotID: "B1"}, "本文"); got != "" {
 		t.Errorf("bot author must not be requester: %q", got)
+	}
+}
+
+// 本文中にラベルと同じ語があっても、行頭かつ直後がコロン・改行でなければ値を切らない
+func TestParseInquiry_LabelWordInsideValue(t *testing.T) {
+	text := "お問い合わせの内容（タイトル）: 権限の追加\n" +
+		"優先度: 中\n" +
+		"お問い合わせの詳細: 優先度は高めでお願いします。\n依頼種別は後で決めます。"
+	got := Parse(text)
+	if got["priority"] != "中" {
+		t.Errorf("priority = %q", got["priority"])
+	}
+	if want := "優先度は高めでお願いします。\n依頼種別は後で決めます。"; got["detail"] != want {
+		t.Errorf("detail = %q, want %q", got["detail"], want)
+	}
+	if _, ok := got["type"]; ok {
+		t.Errorf("type must not be parsed from the detail: %#v", got)
+	}
+}
+
+func TestParseInquiry_BulletLabels(t *testing.T) {
+	got := Parse("• 依頼種別： CI/CD\n• *優先度*：緊急")
+	if got["type"] != "CI/CD" || got["priority"] != "緊急" {
+		t.Errorf("unexpected: %#v", got)
+	}
+}
+
+func TestFormatText(t *testing.T) {
+	cases := map[string]string{
+		"A &amp; B &lt;tag&gt;":                      "A & B <tag>",
+		"<https://example.com/a?x=1&amp;y=2|手順書> 参照": "手順書 (https://example.com/a?x=1&y=2) 参照",
+		"<https://example.com>":                      "https://example.com",
+		"<mailto:a@example.com|a@example.com>":       "a@example.com",
+		"<#C0123|general> で相談":                       "#general で相談",
+		"<!here> 確認お願いします":                           "@here 確認お願いします",
+		"<!subteam^S0123|@infra> 宛":                  "@infra 宛",
+		"変換なし":                                       "変換なし",
+	}
+	for in, want := range cases {
+		if got := FormatText(in); got != want {
+			t.Errorf("FormatText(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

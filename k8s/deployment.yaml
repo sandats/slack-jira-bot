@@ -21,6 +21,14 @@ spec:
         app: slack-jira-bot
     spec:
       serviceAccountName: slack-jira-bot
+      # 2 つの Pod をできるだけ別ノードに置く（ノード 1 台のクラスターでも起動できるよう ScheduleAnyway）
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: slack-jira-bot
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -30,7 +38,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          image: slack-jira-bot:latest   # kustomization.yaml の images で上書き
+          image: slack-jira-bot   # kustomization.yaml の images でリポジトリとタグを上書き
           imagePullPolicy: IfNotPresent
           ports:
             - name: health

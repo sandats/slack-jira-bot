@@ -49,7 +49,9 @@ func (f *fakeSlack) serve(w http.ResponseWriter, r *http.Request) {
 	case "conversations.replies":
 		_, _ = w.Write([]byte(replies))
 	case "users.info":
-		_, _ = w.Write([]byte(`{"ok":true,"user":{"id":"U0REQ","name":"hanako","real_name":"花子"}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"id":"U0REQ","name":"hanako","real_name":"花子","profile":{"email":"u@example.com"}}}`))
+	case "chat.getPermalink":
+		_, _ = w.Write([]byte(`{"ok":true,"permalink":"https://slack.example/archives/C1/p111222"}`))
 	default:
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}
@@ -104,7 +106,7 @@ func TestHandleBlockActions_OpensModalBeforeSlowCalls(t *testing.T) {
 	app, f := newTestApp(t)
 	f.replies = repliesOK
 
-	app.handleBlockActions(openButtonCallback("U0OK"))
+	app.handleBlockActions(t.Context(), openButtonCallback("U0OK"))
 
 	calls := f.snapshot()
 	if len(calls) == 0 || calls[0] != "views.open" {
@@ -149,7 +151,7 @@ func TestHandleShortcut_OpensModalFirst(t *testing.T) {
 	cb.Message.Timestamp = "111.222"
 	cb.Message.Text = "お問い合わせの内容（タイトル）: <@U0REQ> 権限申請\n依頼種別: 使い方"
 
-	app.handleShortcut(cb)
+	app.handleShortcut(t.Context(), cb)
 
 	calls := f.snapshot()
 	if len(calls) < 3 || calls[0] != "views.open" || calls[len(calls)-1] != "views.update" {
@@ -165,7 +167,7 @@ func TestHandleBlockActions_LoadFailureUpdatesModal(t *testing.T) {
 	app, f := newTestApp(t)
 	f.replies = `{"ok":false,"error":"channel_not_found"}`
 
-	app.handleBlockActions(openButtonCallback("U0OK"))
+	app.handleBlockActions(t.Context(), openButtonCallback("U0OK"))
 
 	calls := f.snapshot()
 	if len(calls) != 3 || calls[0] != "views.open" || calls[1] != "conversations.replies" || calls[2] != "views.update" {
@@ -183,7 +185,7 @@ func TestHandleBlockActions_LoadFailureUpdatesModal(t *testing.T) {
 
 func TestHandleBlockActions_DeniedUser(t *testing.T) {
 	app, f := newTestApp(t)
-	app.handleBlockActions(openButtonCallback("U0NG"))
+	app.handleBlockActions(t.Context(), openButtonCallback("U0NG"))
 
 	calls := f.snapshot()
 	if len(calls) != 1 || calls[0] != "chat.postEphemeral" {
@@ -199,7 +201,7 @@ func TestHandleShortcut_DeniedUser(t *testing.T) {
 	cb.TriggerID = "trigger-1"
 	cb.Message.Timestamp = "111.222"
 
-	app.handleShortcut(cb)
+	app.handleShortcut(t.Context(), cb)
 
 	if calls := f.snapshot(); slices.Contains(calls, "views.open") {
 		t.Errorf("権限のないユーザーにモーダルを開いています: %v", calls)
