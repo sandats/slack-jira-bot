@@ -326,8 +326,9 @@ func (a *App) buildModal(channel string, msg slack.Message) slack.ModalViewReque
 
 	// 問い合わせ者の特定は、メンション置換の前の本文で行う
 	requesterID := inquiry.FindRequesterID(im, fullText)
-	title = a.replaceMentions(title)
-	detail = a.replaceMentions(detail)
+	// Slack の記法（<URL|表示名>、&amp; など）を普通のテキストに戻してから Jira へ渡す
+	title = inquiry.FormatText(a.replaceMentions(title))
+	detail = inquiry.FormatText(a.replaceMentions(detail))
 
 	reqType := inquiry.PickOption(parsed["type"], inquiry.RequestTypes)
 	priority := inquiry.PickOption(parsed["priority"], inquiry.Priorities)

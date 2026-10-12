@@ -6,6 +6,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,9 +47,19 @@ type Attachment struct {
 }
 
 var (
-	mentionRe = regexp.MustCompile(`<@([UW][A-Z0-9]+)(?:\|[^>]*)?>`)
-	dateRe    = regexp.MustCompile(`(\d{4})\D+(\d{1,2})\D+(\d{1,2})`)
-	cmdRe     = regexp.MustCompile(`(?i)(close|cancel|cansel|クローズ|キャンセル)\s+([A-Za-z][A-Za-z0-9_]*-\d+)`)
+	mentionRe     = regexp.MustCompile(`<@([UW][A-Z0-9]+)(?:\|[^>]*)?>`)
+	dateRe        = regexp.MustCompile(`(\d{4})\D+(\d{1,2})\D+(\d{1,2})`)
+	compactDateRe = regexp.MustCompile(`(?:^|\D)(\d{4})(\d{2})(\d{2})(?:\D|$)`) // 20261020
+	// 単語の途中（disclose など）にはマッチさせない。RE2 の \b は日本語に効かないため前方を明示する
+	cmdRe       = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])(close|cancel|cansel|クローズ|キャンセル)\s+([A-Za-z][A-Za-z0-9_]*-\d+)`)
+	slackMarkRe = regexp.MustCompile(`<([^<>]+)>`)
+
+	// Slack はメッセージ本文の &, <, > だけをエスケープする
+	slackUnescaper = strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&")
+
+	// 全角数字を半角にする（日付の解釈用）
+	fullWidthDigits = strings.NewReplacer("０", "0", "１", "1", "２", "2", "３", "3", "４", "4",
+		"５", "5", "６", "6", "７", "7", "８", "8", "９", "9")
 
 	aliasToKey map[string]string
 	labelRe    *regexp.Regexp
@@ -77,8 +88,10 @@ func init() {
 	for i, a := range aliases {
 		quoted[i] = regexp.QuoteMeta(a)
 	}
+	// ラベルとみなすのは「行頭にあり、直後がコロンか改行」のときだけ。
+	// 本文中の「優先度は高めで…」のような語でラベル扱いして値を切らないようにする。
 	labelRe = regexp.MustCompile(
-		`[\*_]*(` + strings.Join(quoted, "|") + `)[\*_\s]*[:：]?[\*_\s]*`,
+		`(?m)^[ \t]*(?:[•・\-][ \t]*)?[\*_]*(` + strings.Join(quoted, "|") + `)[\*_]*[ \t]*(?:[:：][\*_ \t]*|\r?\n)`,
 	)
 }
 
@@ -248,20 +261,54 @@ func PickOption(value string, options []string) string {
 	return ""
 }
 
-// ParseDate は「2026/10/20」「2026年10月20日」などを YYYY-MM-DD にする。解釈できなければ空文字。
+// FormatText は Slack の mrkdwn 本文を、Jira やモーダルに入れる普通のテキストにする。
+// <URL|表示名>・<#C123|channel>・<!here> などの記法を展開し、&amp; などのエスケープを戻す。
+// メンション（<@U123>）は先に ReplaceMentions で置き換えておくこと。
+func FormatText(s string) string {
+	s = slackMarkRe.ReplaceAllStringFunc(s, func(m string) string {
+		target, label, _ := strings.Cut(m[1:len(m)-1], "|")
+		switch {
+		case strings.HasPrefix(target, "#"): // チャンネル
+			if label != "" {
+				return "#" + label
+			}
+			return target
+		case strings.HasPrefix(target, "!"): // <!here>、<!subteam^S123|@team>、<!date^...|表示>
+			if label != "" {
+				return label
+			}
+			return "@" + target[1:]
+		case strings.HasPrefix(target, "@"): // 置き換え漏れのメンション
+			if label != "" {
+				return "@" + label
+			}
+			return target
+		default: // URL・メールアドレス
+			target = strings.TrimPrefix(target, "mailto:")
+			if label != "" && label != target {
+				return label + " (" + target + ")"
+			}
+			return target
+		}
+	})
+	return slackUnescaper.Replace(s)
+}
+
+// ParseDate は「2026/10/20」「2026年10月20日」「20261020」などを YYYY-MM-DD にする。
+// 全角数字も受け付ける。解釈できなければ空文字。
 func ParseDate(value string) string {
+	value = fullWidthDigits.Replace(value)
 	m := dateRe.FindStringSubmatch(value)
+	if m == nil {
+		m = compactDateRe.FindStringSubmatch(value)
+	}
 	if m == nil {
 		return ""
 	}
-	var y, mo, d int
-	for i, p := range []*int{&y, &mo, &d} {
-		n := 0
-		for _, r := range m[i+1] {
-			n = n*10 + int(r-'0')
-		}
-		*p = n
-	}
+	// 正規表現で数字だけに絞っているため Atoi は失敗しない
+	y, _ := strconv.Atoi(m[1])
+	mo, _ := strconv.Atoi(m[2])
+	d, _ := strconv.Atoi(m[3])
 	t := time.Date(y, time.Month(mo), d, 0, 0, 0, 0, time.UTC)
 	if t.Year() != y || int(t.Month()) != mo || t.Day() != d {
 		return ""
