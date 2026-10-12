@@ -1,0 +1,9 @@
+# 改行コードは OS にかかわらず LF に統一する（Windows の core.autocrlf=true でも CRLF にしない）。
+# Go・YAML・Dockerfile・シェルスクリプトは LF 前提のため。
+* text=auto eol=lf
+
+# バイナリとして扱う（改行の変換をしない）
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
