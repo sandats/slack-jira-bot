@@ -2,12 +2,16 @@
 package slackapp
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -62,16 +66,29 @@ type buttonValue struct {
 	ThreadTS string `json:"thread_ts"`
 }
 
+// taskTimeout は 1 回のイベント処理にかける上限。終了時の待ち時間（main の 20 秒）内に収まるようにする。
+const taskTimeout = 15 * time.Second
+
 // spawn は処理をゴルーチンで実行する（イベントループを塞がない）。
-func (a *App) spawn(name string, f func()) {
+// 処理には taskTimeout 付きの context を渡し、Slack・Jira の呼び出しが詰まっても必ず終わるようにする。
+func (a *App) spawn(name string, f func(ctx context.Context)) {
 	a.wg.Go(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
+		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("パニックを回復しました", "task", name, "panic", fmt.Sprint(r))
 			}
 		}()
-		f()
+		f(ctx)
 	})
+}
+
+// newRef はユーザーに見せるエラーの参照 ID を作る。詳細はこの ID と一緒にログへ出す。
+func newRef() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // Wait は処理中のゴルーチンの完了を待つ。
@@ -100,7 +117,7 @@ func (a *App) HandleEvent(evt socketmode.Event) {
 		a.ack(*evt.Request) // 3 秒以内に先に ack
 		slog.Info("受信", "type", "events_api", "event", ev.InnerEvent.Type)
 		if m, ok := ev.InnerEvent.Data.(*slackevents.AppMentionEvent); ok {
-			a.spawn("mention", func() { a.handleMention(m) })
+			a.spawn("mention", func(ctx context.Context) { a.handleMention(ctx, m) })
 		}
 
 	case socketmode.EventTypeInteractive:
@@ -127,9 +144,9 @@ func (a *App) dispatchInteraction(cb slack.InteractionCallback) {
 		if cb.CallbackID != callbackID {
 			return
 		}
-		a.spawn("shortcut", func() { a.handleShortcut(cb) })
+		a.spawn("shortcut", func(ctx context.Context) { a.handleShortcut(ctx, cb) })
 	case slack.InteractionTypeBlockActions:
-		a.spawn("block_actions", func() { a.handleBlockActions(cb) })
+		a.spawn("block_actions", func(ctx context.Context) { a.handleBlockActions(ctx, cb) })
 	case slack.InteractionTypeViewSubmission:
 		if cb.View.CallbackID != modalID {
 			return
@@ -138,7 +155,7 @@ func (a *App) dispatchInteraction(cb slack.InteractionCallback) {
 			slog.Warn("権限のないユーザーが送信", "user", cb.User.ID, "name", cb.User.Name)
 			return
 		}
-		a.spawn("submission", func() { a.handleSubmission(cb) })
+		a.spawn("submission", func(ctx context.Context) { a.handleSubmission(ctx, cb) })
 	}
 }
 
@@ -146,7 +163,7 @@ func (a *App) dispatchInteraction(cb slack.InteractionCallback) {
 // ショートカット / ボタン
 // ---------------------------------------------------------------
 
-func (a *App) handleShortcut(cb slack.InteractionCallback) {
+func (a *App) handleShortcut(ctx context.Context, cb slack.InteractionCallback) {
 	uid, uname, ch := cb.User.ID, cb.User.Name, cb.Channel.ID
 	if !a.cfg.IsAllowed(uid) {
 		slog.Warn("権限のないユーザーが実行", "user", uid, "name", uname, "channel", ch)
@@ -156,18 +173,18 @@ func (a *App) handleShortcut(cb slack.InteractionCallback) {
 			if threadTS == "" {
 				threadTS = cb.Message.Timestamp
 			}
-			a.replyEphemeral(ch, uid, threadTS, denyText)
+			a.replyEphemeral(ctx, ch, uid, threadTS, denyText)
 		}
 		return
 	}
 	// メッセージショートカットは元メッセージが payload に含まれる
 	load := func() (slack.Message, error) { return cb.Message, nil }
-	if err := a.openModal(cb.TriggerID, ch, load); err != nil {
+	if err := a.openModal(ctx, cb.TriggerID, ch, load); err != nil {
 		slog.Error("モーダルの表示に失敗", "user", uid, "name", uname, "channel", ch, "error", err)
 	}
 }
 
-func (a *App) handleBlockActions(cb slack.InteractionCallback) {
+func (a *App) handleBlockActions(ctx context.Context, cb slack.InteractionCallback) {
 	uid, uname := cb.User.ID, cb.User.Name
 
 	var act *slack.BlockAction
@@ -189,13 +206,13 @@ func (a *App) handleBlockActions(cb slack.InteractionCallback) {
 
 	if !a.cfg.IsAllowed(uid) {
 		slog.Warn("権限のないユーザーがボタンを押下", "user", uid, "name", uname, "channel", v.Channel)
-		a.replyEphemeral(v.Channel, uid, v.ThreadTS, denyText)
+		a.replyEphemeral(ctx, v.Channel, uid, v.ThreadTS, denyText)
 		return
 	}
 
 	// 親メッセージ（問い合わせ本文）は、モーダルを開いた後に取得する
 	load := func() (slack.Message, error) {
-		msgs, _, _, err := a.api.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		msgs, _, _, err := a.api.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
 			ChannelID: v.Channel,
 			Timestamp: v.ThreadTS,
 			Limit:     1,
@@ -209,7 +226,7 @@ func (a *App) handleBlockActions(cb slack.InteractionCallback) {
 		}
 		return msgs[0], nil
 	}
-	if err := a.openModal(cb.TriggerID, v.Channel, load); err != nil {
+	if err := a.openModal(ctx, cb.TriggerID, v.Channel, load); err != nil {
 		slog.Error("モーダルの表示に失敗", "user", uid, "name", uname, "channel", v.Channel, "ts", v.ThreadTS, "error", err)
 	}
 }
@@ -286,8 +303,8 @@ func noticeView(text string) slack.ModalViewRequest {
 
 // openModal はモーダルを開く。trigger_id は 3 秒で失効するため、先に読み込み中のモーダルを開き、
 // 元メッセージの取得・解析（Slack API の呼び出しを伴う）が終わってから views.update で中身を差し替える。
-func (a *App) openModal(triggerID, channel string, load func() (slack.Message, error)) error {
-	opened, err := a.api.OpenView(triggerID, noticeView("元のメッセージを読み込んでいます…"))
+func (a *App) openModal(ctx context.Context, triggerID, channel string, load func() (slack.Message, error)) error {
+	opened, err := a.api.OpenViewContext(ctx, triggerID, noticeView("元のメッセージを読み込んでいます…"))
 	if err != nil {
 		return fmt.Errorf("views.open: %w", err)
 	}
@@ -295,10 +312,10 @@ func (a *App) openModal(triggerID, channel string, load func() (slack.Message, e
 	view := noticeView("元のメッセージを取得できませんでした。")
 	msg, loadErr := load()
 	if loadErr == nil {
-		view = a.buildModal(channel, msg)
+		view = a.buildModal(ctx, channel, msg)
 	}
 	// hash を渡し、利用者が閉じた・別の更新が入ったなどで状態が変わっていれば上書きしない
-	if _, err := a.api.UpdateView(view, "", opened.Hash, opened.ID); err != nil {
+	if _, err := a.api.UpdateViewContext(ctx, view, "", opened.Hash, opened.ID); err != nil {
 		return fmt.Errorf("views.update: %w", err)
 	}
 	if loadErr != nil {
@@ -308,7 +325,7 @@ func (a *App) openModal(triggerID, channel string, load func() (slack.Message, e
 }
 
 // buildModal は元メッセージを解析して、入力済みのチケット作成モーダルを組み立てる。
-func (a *App) buildModal(channel string, msg slack.Message) slack.ModalViewRequest {
+func (a *App) buildModal(ctx context.Context, channel string, msg slack.Message) slack.ModalViewRequest {
 	im := toInquiryMessage(msg)
 	fullText, parsed := inquiry.Extract(im)
 
@@ -327,8 +344,8 @@ func (a *App) buildModal(channel string, msg slack.Message) slack.ModalViewReque
 	// 問い合わせ者の特定は、メンション置換の前の本文で行う
 	requesterID := inquiry.FindRequesterID(im, fullText)
 	// Slack の記法（<URL|表示名>、&amp; など）を普通のテキストに戻してから Jira へ渡す
-	title = inquiry.FormatText(a.replaceMentions(title))
-	detail = inquiry.FormatText(a.replaceMentions(detail))
+	title = inquiry.FormatText(a.replaceMentions(ctx, title))
+	detail = inquiry.FormatText(a.replaceMentions(ctx, detail))
 
 	reqType := inquiry.PickOption(parsed["type"], inquiry.RequestTypes)
 	priority := inquiry.PickOption(parsed["priority"], inquiry.Priorities)
@@ -368,7 +385,7 @@ func (a *App) buildModal(channel string, msg slack.Message) slack.ModalViewReque
 	}
 }
 
-func (a *App) handleSubmission(cb slack.InteractionCallback) {
+func (a *App) handleSubmission(ctx context.Context, cb slack.InteractionCallback) {
 	user := cb.User.ID
 	if cb.View.State == nil {
 		slog.Error("モーダル入力が空です", "user", user)
@@ -389,7 +406,7 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 
 	permalink := ""
 	if meta.Channel != "" && meta.TS != "" {
-		p, err := a.api.GetPermalink(&slack.PermalinkParameters{Channel: meta.Channel, Ts: meta.TS})
+		p, err := a.api.GetPermalinkContext(ctx, &slack.PermalinkParameters{Channel: meta.Channel, Ts: meta.TS})
 		if err != nil {
 			slog.Error("permalink の取得に失敗（続行します）", "error", err)
 		} else {
@@ -398,11 +415,11 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 	}
 
 	requester := fmt.Sprintf("%s (%s)", cb.User.Name, user)
-	assigneeID := a.jiraAccountID(user) // ショートカットを押した人
-	reporterID := a.jiraAccountID(meta.Author)
+	assigneeID := a.jiraAccountID(ctx, user) // ショートカットを押した人
+	reporterID := a.jiraAccountID(ctx, meta.Author)
 	reporterName := ""
 	if meta.Author != "" {
-		reporterName = a.replaceMentions("<@" + meta.Author + ">")
+		reporterName = a.replaceMentions(ctx, "<@"+meta.Author+">")
 	}
 
 	var notes []string
@@ -414,14 +431,17 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 	}
 
 	var text string
-	key, err := a.jira.CreateIssue(jira.IssueInput{
+	key, err := a.jira.CreateIssue(ctx, jira.IssueInput{
 		Summary: summary, Detail: detail, ReqType: reqType, Priority: priority, Due: due,
 		Requester: requester, ReporterName: reporterName,
 		AssigneeID: assigneeID, ReporterID: reporterID,
 	})
 	if err != nil {
-		slog.Error("Jira チケット作成に失敗", "user", user, "error", err)
-		text = fmt.Sprintf("<@%s> Jira チケットの作成に失敗しました: %v", user, err)
+		// Jira のエラー本文は公開チャンネルに出さず、参照 ID で突き合わせられるようログにだけ残す
+		ref := newRef()
+		slog.Error("Jira チケット作成に失敗", "ref", ref, "user", user, "error", err)
+		text = fmt.Sprintf("<@%s> Jira チケットの作成に失敗しました。時間をおいて再度お試しください。"+
+			"解決しない場合は管理者に連絡してください（参照 ID: %s）", user, ref)
 	} else {
 		slog.Info("Jira チケット作成成功", "key", key, "user", user)
 		text = fmt.Sprintf("<@%s> チケットを作成しました: %s/browse/%s", user, a.cfg.Jira.BaseURL, key)
@@ -429,7 +449,7 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 		// 元メッセージを Web リンクとして追加（失敗してもチケットは残す）
 		if permalink != "" {
 			gid := fmt.Sprintf("slack-%s-%s", meta.Channel, meta.TS)
-			if err := a.jira.AddRemoteLink(key, permalink, "Slack の元メッセージ", gid); err != nil {
+			if err := a.jira.AddRemoteLink(ctx, key, permalink, "Slack の元メッセージ", gid); err != nil {
 				slog.Error("Web リンクの追加に失敗", "key", key, "user", user, "error", err)
 				notes = append(notes, "Web リンクを追加できませんでした")
 			}
@@ -440,9 +460,9 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 	}
 
 	if meta.Channel != "" {
-		a.replyThread(meta.Channel, meta.ThreadTS, text)
+		a.replyThread(ctx, meta.Channel, meta.ThreadTS, text)
 	} else {
-		a.replyThread(user, "", text) // グローバルショートカットの場合は DM
+		a.replyThread(ctx, user, "", text) // グローバルショートカットの場合は DM
 	}
 }
 
@@ -450,7 +470,7 @@ func (a *App) handleSubmission(cb slack.InteractionCallback) {
 // メンション（@App / close / cancel）
 // ---------------------------------------------------------------
 
-func (a *App) handleMention(ev *slackevents.AppMentionEvent) {
+func (a *App) handleMention(ctx context.Context, ev *slackevents.AppMentionEvent) {
 	uid, ch := ev.User, ev.Channel
 	if ev.BotID != "" || uid == "" || ch == "" {
 		return
@@ -463,28 +483,28 @@ func (a *App) handleMention(ev *slackevents.AppMentionEvent) {
 
 	if !a.cfg.IsAllowed(uid) {
 		slog.Warn("権限のないユーザーがメンション", "user", uid, "channel", ch)
-		a.replyEphemeral(ch, uid, replyTS, denyText)
+		a.replyEphemeral(ctx, ch, uid, replyTS, denyText)
 		return
 	}
 
 	if action, key, ok := inquiry.ParseCommand(ev.Text); ok {
-		a.runTransitionCommand(uid, ch, replyTS, action, key)
+		a.runTransitionCommand(ctx, uid, ch, replyTS, action, key)
 		return
 	}
 
 	if ev.ThreadTimeStamp == "" {
-		a.replyEphemeral(ch, uid, replyTS, fmt.Sprintf(
+		a.replyEphemeral(ctx, ch, uid, replyTS, fmt.Sprintf(
 			"問い合わせメッセージのスレッド内でメンションしてください。\n"+
 				"ステータス更新は `@App close %[1]s-123` / `@App cancel %[1]s-123` の形式です。",
 			a.cfg.Jira.ProjectKey))
 		return
 	}
-	if err := a.postCreateButton(ch, ev.ThreadTimeStamp); err != nil {
+	if err := a.postCreateButton(ctx, ch, ev.ThreadTimeStamp); err != nil {
 		slog.Error("作成ボタンの投稿に失敗", "channel", ch, "error", err)
 	}
 }
 
-func (a *App) postCreateButton(ch, threadTS string) error {
+func (a *App) postCreateButton(ctx context.Context, ch, threadTS string) error {
 	val, _ := json.Marshal(buttonValue{Channel: ch, ThreadTS: threadTS})
 	btn := slack.NewButtonBlockElement(actionOpenModal, string(val),
 		slack.NewTextBlockObject(slack.PlainTextType, "Jira チケットを作成", false, false))
@@ -493,7 +513,7 @@ func (a *App) postCreateButton(ch, threadTS string) error {
 	section := slack.NewSectionBlock(
 		slack.NewTextBlockObject(slack.MarkdownType, "このスレッドの問い合わせから Jira チケットを作成します。", false, false),
 		nil, nil)
-	_, _, err := a.api.PostMessage(ch,
+	_, _, err := a.api.PostMessageContext(ctx, ch,
 		slack.MsgOptionTS(threadTS),
 		slack.MsgOptionText("Jira チケットを作成できます", false),
 		slack.MsgOptionBlocks(section, slack.NewActionBlock("", btn)),
@@ -501,39 +521,41 @@ func (a *App) postCreateButton(ch, threadTS string) error {
 	return err
 }
 
-func (a *App) runTransitionCommand(uid, ch, replyTS, action, key string) {
+func (a *App) runTransitionCommand(ctx context.Context, uid, ch, replyTS, action, key string) {
 	conf := a.cfg.Jira.Transitions[action]
 	prefix, _, _ := strings.Cut(key, "-")
 	if !strings.EqualFold(prefix, a.cfg.Jira.ProjectKey) {
-		a.replyThread(ch, replyTS,
+		a.replyThread(ctx, ch, replyTS,
 			fmt.Sprintf("<@%s> %s は対象外のプロジェクトです（対象: %s）", uid, key, a.cfg.Jira.ProjectKey))
 		return
 	}
 
-	if err := a.jira.TransitionIssue(key, action); err != nil {
-		slog.Error("ステータス更新に失敗", "key", key, "action", action, "user", uid, "error", err)
+	if err := a.jira.TransitionIssue(ctx, key, action); err != nil {
+		ref := newRef()
+		slog.Error("ステータス更新に失敗", "ref", ref, "key", key, "action", action, "user", uid, "error", err)
+		// 遷移名の一覧は利用者が次の操作を判断するのに必要なので返す（Jira のエラー本文は返さない）
 		hint := ""
-		if avail := a.jira.AvailableTransitions(key); len(avail) > 0 {
+		if avail := a.jira.AvailableTransitions(ctx, key); len(avail) > 0 {
 			hint = "\n現在実行できる遷移: " + strings.Join(avail, ", ")
 		}
-		a.replyThread(ch, replyTS,
-			fmt.Sprintf("<@%s> %s を %s できませんでした: %v%s", uid, key, conf.Label, err, hint))
+		a.replyThread(ctx, ch, replyTS,
+			fmt.Sprintf("<@%s> %s を %s できませんでした（参照 ID: %s）%s", uid, key, conf.Label, ref, hint))
 		return
 	}
 	slog.Info("ステータス更新成功", "key", key, "action", action, "user", uid)
 
 	// 遷移はサービスアカウントで実行されるため、指示した人をコメントに残す
-	uname := a.replaceMentions("<@" + uid + ">")
-	if err := a.jira.AddComment(key, fmt.Sprintf("Slack から %s (%s) が %s を実行しました。", uname, uid, conf.Label)); err != nil {
+	uname := a.replaceMentions(ctx, "<@"+uid+">")
+	if err := a.jira.AddComment(ctx, key, fmt.Sprintf("Slack から %s (%s) が %s を実行しました。", uname, uid, conf.Label)); err != nil {
 		slog.Error("コメントの追加に失敗（続行します）", "key", key, "error", err)
 	}
 
 	text := fmt.Sprintf("<@%s> %s を %s しました", uid, key, conf.Label)
-	if st := a.jira.StatusName(key); st != "" {
+	if st := a.jira.StatusName(ctx, key); st != "" {
 		text += fmt.Sprintf("（現在のステータス: %s）", st)
 	}
 	text += fmt.Sprintf("\n%s/browse/%s", a.cfg.Jira.BaseURL, key)
-	a.replyThread(ch, replyTS, text)
+	a.replyThread(ctx, ch, replyTS, text)
 }
 
 // ---------------------------------------------------------------
@@ -541,34 +563,34 @@ func (a *App) runTransitionCommand(uid, ch, replyTS, action, key string) {
 // ---------------------------------------------------------------
 
 // replyEphemeral は本人にだけ見えるメッセージをスレッドに返す。失敗してもログのみ。
-func (a *App) replyEphemeral(ch, user, threadTS, text string) {
+func (a *App) replyEphemeral(ctx context.Context, ch, user, threadTS, text string) {
 	opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-	if _, err := a.api.PostEphemeral(ch, user, opts...); err != nil {
+	if _, err := a.api.PostEphemeralContext(ctx, ch, user, opts...); err != nil {
 		slog.Error("一時メッセージの送信に失敗", "user", user, "channel", ch, "error", err)
 	}
 }
 
-func (a *App) replyThread(ch, threadTS, text string) {
+func (a *App) replyThread(ctx context.Context, ch, threadTS, text string) {
 	opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-	if _, _, err := a.api.PostMessage(ch, opts...); err != nil {
+	if _, _, err := a.api.PostMessageContext(ctx, ch, opts...); err != nil {
 		slog.Error("Slack への投稿に失敗", "channel", ch, "error", err)
 	}
 }
 
 // replaceMentions は <@U12345> を @表示名 に置換する（結果は Pod 内でキャッシュ）。
-func (a *App) replaceMentions(text string) string {
+func (a *App) replaceMentions(ctx context.Context, text string) string {
 	return inquiry.ReplaceMentions(text, func(uid string) string {
 		if v, ok := a.names.Load(uid); ok {
 			return v.(string)
 		}
 		name := "@" + uid
-		if u, err := a.api.GetUserInfo(uid); err == nil {
+		if u, err := a.api.GetUserInfoContext(ctx, uid); err == nil {
 			switch {
 			case u.RealName != "":
 				name = "@" + u.RealName
@@ -582,14 +604,14 @@ func (a *App) replaceMentions(text string) string {
 }
 
 // jiraAccountID は Slack ユーザー ID から Jira の accountId を返す。解決できなければ空文字。
-func (a *App) jiraAccountID(slackUserID string) string {
+func (a *App) jiraAccountID(ctx context.Context, slackUserID string) string {
 	if slackUserID == "" {
 		return ""
 	}
 	if v, ok := a.accounts.Load(slackUserID); ok {
 		return v.(string)
 	}
-	u, err := a.api.GetUserInfo(slackUserID)
+	u, err := a.api.GetUserInfoContext(ctx, slackUserID)
 	if err != nil {
 		slog.Error("Slack ユーザー情報の取得に失敗", "user", slackUserID, "error", err)
 		return ""
@@ -602,7 +624,7 @@ func (a *App) jiraAccountID(slackUserID string) string {
 		slog.Warn("Slack ユーザーのメールを取得できません", "user", slackUserID)
 		return ""
 	}
-	id, err := a.jira.AccountIDByEmail(email)
+	id, err := a.jira.AccountIDByEmail(ctx, email)
 	if err != nil {
 		slog.Warn("Jira ユーザー検索に失敗", "user", slackUserID, "error", err)
 		return ""

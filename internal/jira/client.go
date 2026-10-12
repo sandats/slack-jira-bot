@@ -3,7 +3,9 @@ package jira
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,7 +63,7 @@ func New(cfg Config) *Client {
 }
 
 // do は Jira API を呼び出し、(ステータス, 本文) を返す。通信エラーのみ err。
-func (j *Client) do(method, path string, query url.Values, body any) (int, []byte, error) {
+func (j *Client) do(ctx context.Context, method, path string, query url.Values, body any) (int, []byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -74,7 +76,7 @@ func (j *Client) do(method, path string, query url.Values, body any) (int, []byt
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequest(method, u, rd)
+	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -85,6 +87,11 @@ func (j *Client) do(method, path string, query url.Values, body any) (int, []byt
 	}
 	resp, err := j.hc.Do(req)
 	if err != nil {
+		// *url.Error はリクエスト URL（cloudId を含む）を文字列に含めるため、パスだけに差し替える
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return 0, nil, fmt.Errorf("%s %s: %w", method, path, ue.Err)
+		}
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
@@ -188,8 +195,8 @@ func (j *Client) buildIssueFields(in IssueInput) map[string]any {
 	return fields
 }
 
-func (j *Client) CreateIssue(in IssueInput) (string, error) {
-	status, body, err := j.do("POST", "/rest/api/3/issue", nil,
+func (j *Client) CreateIssue(ctx context.Context, in IssueInput) (string, error) {
+	status, body, err := j.do(ctx, "POST", "/rest/api/3/issue", nil,
 		map[string]any{"fields": j.buildIssueFields(in)})
 	if err != nil {
 		return "", err
@@ -208,12 +215,12 @@ func (j *Client) CreateIssue(in IssueInput) (string, error) {
 
 // AddRemoteLink は Slack の元メッセージを Web リンクとして追加する。
 // 同じ globalId のリンクは重複追加されず更新扱いになる。
-func (j *Client) AddRemoteLink(issueKey, linkURL, title, globalID string) error {
+func (j *Client) AddRemoteLink(ctx context.Context, issueKey, linkURL, title, globalID string) error {
 	body := map[string]any{"object": map[string]any{"url": linkURL, "title": title}}
 	if globalID != "" {
 		body["globalId"] = globalID
 	}
-	status, resp, err := j.do("POST", "/rest/api/3/issue/"+issueKey+"/remotelink", nil, body)
+	status, resp, err := j.do(ctx, "POST", "/rest/api/3/issue/"+issueKey+"/remotelink", nil, body)
 	if err != nil {
 		return err
 	}
@@ -226,8 +233,8 @@ func (j *Client) AddRemoteLink(issueKey, linkURL, title, globalID string) error 
 // ---- ユーザー検索 ----
 
 // AccountIDByEmail はメールアドレスから Jira の accountId を引く。見つからなければ空文字。
-func (j *Client) AccountIDByEmail(email string) (string, error) {
-	status, body, err := j.do("GET", "/rest/api/3/user/search", url.Values{"query": {email}}, nil)
+func (j *Client) AccountIDByEmail(ctx context.Context, email string) (string, error) {
+	status, body, err := j.do(ctx, "GET", "/rest/api/3/user/search", url.Values{"query": {email}}, nil)
 	if err != nil {
 		return "", err
 	}
@@ -263,7 +270,7 @@ func (j *Client) AccountIDByEmail(email string) (string, error) {
 
 // ---- ステータス更新（close / cancel）----
 
-func (j *Client) TransitionIssue(issueKey, action string) error {
+func (j *Client) TransitionIssue(ctx context.Context, issueKey, action string) error {
 	conf, ok := j.cfg.Transitions[action]
 	if !ok || conf.ID == "" {
 		return fmt.Errorf("%s の遷移 ID が未設定です（管理者に連絡してください）", action)
@@ -272,7 +279,7 @@ func (j *Client) TransitionIssue(issueKey, action string) error {
 	if conf.Resolution != "" {
 		body["fields"] = map[string]any{"resolution": map[string]any{"name": conf.Resolution}}
 	}
-	status, resp, err := j.do("POST", "/rest/api/3/issue/"+issueKey+"/transitions", nil, body)
+	status, resp, err := j.do(ctx, "POST", "/rest/api/3/issue/"+issueKey+"/transitions", nil, body)
 	if err != nil {
 		return err
 	}
@@ -283,8 +290,8 @@ func (j *Client) TransitionIssue(issueKey, action string) error {
 }
 
 // AvailableTransitions はその課題の現在のステータスから実行できる遷移の一覧（失敗時は空）。
-func (j *Client) AvailableTransitions(issueKey string) []string {
-	status, body, err := j.do("GET", "/rest/api/3/issue/"+issueKey+"/transitions", nil, nil)
+func (j *Client) AvailableTransitions(ctx context.Context, issueKey string) []string {
+	status, body, err := j.do(ctx, "GET", "/rest/api/3/issue/"+issueKey+"/transitions", nil, nil)
 	if err != nil || status != http.StatusOK {
 		return nil
 	}
@@ -304,8 +311,8 @@ func (j *Client) AvailableTransitions(issueKey string) []string {
 	return out
 }
 
-func (j *Client) StatusName(issueKey string) string {
-	status, body, err := j.do("GET", "/rest/api/3/issue/"+issueKey,
+func (j *Client) StatusName(ctx context.Context, issueKey string) string {
+	status, body, err := j.do(ctx, "GET", "/rest/api/3/issue/"+issueKey,
 		url.Values{"fields": {"status"}}, nil)
 	if err != nil || status != http.StatusOK {
 		return ""
@@ -323,8 +330,8 @@ func (j *Client) StatusName(issueKey string) string {
 	return res.Fields.Status.Name
 }
 
-func (j *Client) AddComment(issueKey, text string) error {
-	status, body, err := j.do("POST", "/rest/api/3/issue/"+issueKey+"/comment", nil,
+func (j *Client) AddComment(ctx context.Context, issueKey, text string) error {
+	status, body, err := j.do(ctx, "POST", "/rest/api/3/issue/"+issueKey+"/comment", nil,
 		map[string]any{"body": adfDoc(adfParagraphs(text))})
 	if err != nil {
 		return err
