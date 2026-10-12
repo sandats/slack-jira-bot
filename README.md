@@ -2,6 +2,50 @@
 
 Slack（Socket Mode）から Jira Cloud のチケットを作成・クローズ/キャンセルするアプリの Go 版です。
 
+## リクエストの流れ
+
+Socket Mode では、アプリ（Pod）から Slack へ WebSocket を張り、イベントはその接続で受け取ります。
+公開エンドポイントは不要で、Slack・Jira への通信はすべて Pod からの外向き通信です。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as ユーザー
+    participant S as Slack
+    participant B as slack-jira-bot (Pod)
+    participant J as Jira Cloud
+
+    Note over S,B: 起動時（App-Level Token: xapp-）
+    B->>S: apps.connections.open
+    S-->>B: WebSocket URL
+    B->>S: WebSocket 接続（以降のイベントはこの接続で届く）
+
+    Note over U,J: チケット作成
+    U->>S: メッセージショートカット<br/>（またはスレッドでメンション → 作成ボタン）
+    S->>B: interactive（WebSocket）
+    B-->>S: ack（3 秒以内）
+    B->>S: views.open（読み込み中のモーダル）
+    B->>S: conversations.replies / users.info
+    B->>S: views.update（入力済みのモーダル）
+    U->>S: モーダルを送信
+    S->>B: view_submission（WebSocket）
+    B-->>S: ack（モーダルが閉じる）
+    B->>J: 課題を作成 / 元メッセージのリンクを追加
+    B->>S: chat.postMessage（スレッドに結果を返信）
+
+    Note over U,J: クローズ / キャンセル
+    U->>S: @App close KEY-123
+    S->>B: app_mention（WebSocket）
+    B-->>S: ack
+    B->>J: ステータスを遷移 / コメントを追加
+    B->>S: chat.postMessage（スレッドに結果を返信）
+```
+
+- 受信は WebSocket 経由です。Slack の Web API（`views.open` や `chat.postMessage` など）は Bot Token（`xoxb-`）を使った HTTPS で呼びます。
+- 受け取ったイベントには、まず 3 秒以内に ack を返し、その後で処理します。Jira の呼び出しなど時間のかかる処理は ack の後に行います。
+- 複数の Pod がそれぞれ接続していても、1 つのイベントはどれか 1 つの Pod にだけ届きます。モーダルを開いた Pod と送信を受ける Pod が別になることがあるため、状態は Pod に持たず、モーダルの `private_metadata` に入れています。
+- `trigger_id` は 3 秒で失効します。そのため、先に読み込み中のモーダルを開き、元メッセージの取得が終わってから中身を差し替えています。
+
 ## 構成
 
 ```text
@@ -43,3 +87,7 @@ slack-go は 1.0 未満で、マイナーバージョンでも破壊的変更が
 
 ## 通信要件
 Egress 443 で `slack.com` / `*.slack.com`（WebSocket 含む）/ `api.atlassian.com` に到達できること。Ingress は不要です。
+
+## ライセンス
+
+[MIT License](LICENSE)
