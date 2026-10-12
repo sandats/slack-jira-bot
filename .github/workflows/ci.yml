@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 新しい脆弱性はコードを変えなくても公開されるため、週 1 回も実行する（月曜 9:00 JST）
+  schedule:
+    - cron: "0 0 * * 1"
 
 permissions:
   contents: read
@@ -49,3 +52,19 @@ jobs:
 
       - name: build
         run: CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/slack-jira-bot
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+
+      # 依存モジュールと Go 標準ライブラリの既知の脆弱性のうち、実際に呼んでいるコードに影響するものを検出する
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

@@ -1,0 +1,65 @@
+# GitHub Actions（.github/workflows/ci.yml）と同じチェックを GitLab CI/CD で行う。
+# 片方を変えたら、もう片方も揃えること。
+
+workflow:
+  rules:
+    # MR では MR パイプラインだけを動かし、ブランチパイプラインとの二重実行を避ける
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # 定期実行（週 1 回の脆弱性チェック用）。スケジュールは
+    # GitLab の「Build > Pipeline schedules」で設定する（例: 0 9 * * 1, Asia/Tokyo）
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+default:
+  # Go を上げるときは Dockerfile のベースイメージ・GitHub Actions の go-version と合わせて更新する
+  # （trixie の通常イメージには、go test -race に必要な gcc が入っている）
+  image: golang:1.27-trixie
+  interruptible: true
+
+variables:
+  # キャッシュはプロジェクトのディレクトリ内にしか置けないため、.cache/ に集める
+  GOPATH: $CI_PROJECT_DIR/.cache/go
+  GOMODCACHE: $CI_PROJECT_DIR/.cache/go/pkg/mod
+  GOCACHE: $CI_PROJECT_DIR/.cache/go-build
+  GOTOOLCHAIN: local
+  GOVULNCHECK_VERSION: v1.8.0
+
+stages:
+  - test
+
+.go-cache:
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .cache/
+
+test:
+  stage: test
+  extends: .go-cache
+  timeout: 10m
+  script:
+    - go version
+    # .cache/ 内の依存モジュールを対象にしないよう、Git 管理下のファイルだけを調べる
+    - |
+      unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+      if [ -n "$unformatted" ]; then
+        echo "gofmt が必要なファイルがあります:"
+        echo "$unformatted"
+        exit 1
+      fi
+    - go mod tidy -diff
+    - go vet ./...
+    - go test -race -count=1 ./...
+    - CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/slack-jira-bot
+
+vulncheck:
+  stage: test
+  extends: .go-cache
+  timeout: 10m
+  script:
+    # 依存モジュールと Go 標準ライブラリの既知の脆弱性のうち、実際に呼んでいるコードに影響するものを検出する
+    - go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...

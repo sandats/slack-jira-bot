@@ -1,0 +1,30 @@
+# 依存関係の更新 PR を自動で作る。
+# 注意: 次のものは Dependabot の対象外なので、更新するときは手で揃える
+#   - CI の Go のバージョン（.github/workflows/ci.yml の go-version、.gitlab-ci.yml のイメージ）
+#   - govulncheck のバージョン（両 CI の go run ...@vX.Y.Z）
+version: 2
+updates:
+  # Go モジュール（slack-go など）
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # 1.0 未満の slack-go はマイナー更新でも破壊的変更があるため、まとめずに個別の PR にする
+      go-patch:
+        update-types: [patch]
+
+  # GitHub Actions（コミット SHA で固定しているため、手での更新は手間がかかる）
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Dockerfile のベースイメージ
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
