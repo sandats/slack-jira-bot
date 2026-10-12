@@ -38,6 +38,9 @@ type App struct {
 	sm   *socketmode.Client
 	jira *jira.Client
 
+	// ackFn は Socket Mode のリクエストへの応答（通常は sm.Ack。テストで差し替える）
+	ackFn func(req socketmode.Request, payload ...any) error
+
 	wg        sync.WaitGroup // 処理中のゴルーチン（終了時に待つ）
 	names     sync.Map       // Slack ユーザー ID -> 表示名
 	accounts  sync.Map       // Slack ユーザー ID -> Jira accountId（解決できたものだけ）
@@ -45,7 +48,11 @@ type App struct {
 }
 
 func New(cfg *config.Config, api *slack.Client, sm *socketmode.Client, jc *jira.Client) *App {
-	return &App{cfg: cfg, api: api, sm: sm, jira: jc}
+	a := &App{cfg: cfg, api: api, sm: sm, jira: jc}
+	if sm != nil {
+		a.ackFn = sm.Ack
+	}
+	return a
 }
 
 // Connected は Socket Mode に接続中かを返す（readiness 用）。
@@ -58,6 +65,9 @@ type modalMeta struct {
 	TS       string `json:"ts"`
 	ThreadTS string `json:"thread_ts"`
 	Author   string `json:"author"` // 問い合わせ者（Slack ユーザー ID）
+	// ButtonTS は「Jira チケットを作成」ボタンのメッセージの ts（ボタン経由のときだけ）。
+	// 作成後にボタンを消して、同じ問い合わせから重複してチケットを作らないようにする。
+	ButtonTS string `json:"button_ts,omitempty"`
 }
 
 // buttonValue は「Jira チケットを作成」ボタンの value に入れる状態。
@@ -110,30 +120,46 @@ func (a *App) HandleEvent(evt socketmode.Event) {
 		slog.Warn("Slack との接続が切れました（自動で再接続します）", "type", string(evt.Type))
 
 	case socketmode.EventTypeEventsAPI:
-		ev, ok := evt.Data.(slackevents.EventsAPIEvent)
-		if !ok || evt.Request == nil {
+		if evt.Request == nil {
 			return
 		}
+		// 中身を解釈できなくても ack は返す（返さないと Slack から再送され続ける）
 		a.ack(*evt.Request) // 3 秒以内に先に ack
+		ev, ok := evt.Data.(slackevents.EventsAPIEvent)
+		if !ok {
+			slog.Warn("想定外の形式のイベントを無視しました", "type", string(evt.Type))
+			return
+		}
 		slog.Info("受信", "type", "events_api", "event", ev.InnerEvent.Type)
 		if m, ok := ev.InnerEvent.Data.(*slackevents.AppMentionEvent); ok {
 			a.spawn("mention", func(ctx context.Context) { a.handleMention(ctx, m) })
 		}
 
 	case socketmode.EventTypeInteractive:
+		if evt.Request == nil {
+			return
+		}
 		cb, ok := evt.Data.(slack.InteractionCallback)
-		if !ok || evt.Request == nil {
+		if !ok {
+			a.ack(*evt.Request)
+			slog.Warn("想定外の形式のイベントを無視しました", "type", string(evt.Type))
+			return
+		}
+		slog.Info("受信", "type", "interactive", "interaction", string(cb.Type), "callback_id", cb.CallbackID)
+		// 権限のないユーザーの送信は、モーダルを閉じずにエラーを表示する
+		if cb.Type == slack.InteractionTypeViewSubmission && cb.View.CallbackID == modalID && !a.cfg.IsAllowed(cb.User.ID) {
+			slog.Warn("権限のないユーザーが送信", "user", cb.User.ID, "name", cb.User.Name)
+			a.ack(*evt.Request, slack.NewErrorsViewSubmissionResponse(map[string]string{"summary": denyText}))
 			return
 		}
 		a.ack(*evt.Request) // 3 秒以内に先に ack（view_submission はこれでモーダルが閉じる）
-		slog.Info("受信", "type", "interactive", "interaction", string(cb.Type), "callback_id", cb.CallbackID)
 		a.dispatchInteraction(cb)
 	}
 }
 
 // ack は Socket Mode のリクエストに応答する。失敗すると Slack から再送されることがあるため記録しておく。
-func (a *App) ack(req socketmode.Request) {
-	if err := a.sm.Ack(req); err != nil {
+func (a *App) ack(req socketmode.Request, payload ...any) {
+	if err := a.ackFn(req, payload...); err != nil {
 		slog.Error("ack に失敗", "envelope_id", req.EnvelopeID, "type", req.Type, "error", err)
 	}
 }
@@ -148,11 +174,8 @@ func (a *App) dispatchInteraction(cb slack.InteractionCallback) {
 	case slack.InteractionTypeBlockActions:
 		a.spawn("block_actions", func(ctx context.Context) { a.handleBlockActions(ctx, cb) })
 	case slack.InteractionTypeViewSubmission:
-		if cb.View.CallbackID != modalID {
-			return
-		}
-		if !a.cfg.IsAllowed(cb.User.ID) {
-			slog.Warn("権限のないユーザーが送信", "user", cb.User.ID, "name", cb.User.Name)
+		// 権限の確認は ack 時に済ませている（HandleEvent）が、念のためここでも弾く
+		if cb.View.CallbackID != modalID || !a.cfg.IsAllowed(cb.User.ID) {
 			return
 		}
 		a.spawn("submission", func(ctx context.Context) { a.handleSubmission(ctx, cb) })
@@ -179,7 +202,7 @@ func (a *App) handleShortcut(ctx context.Context, cb slack.InteractionCallback) 
 	}
 	// メッセージショートカットは元メッセージが payload に含まれる
 	load := func() (slack.Message, error) { return cb.Message, nil }
-	if err := a.openModal(ctx, cb.TriggerID, ch, load); err != nil {
+	if err := a.openModal(ctx, cb.TriggerID, ch, "", load); err != nil {
 		slog.Error("モーダルの表示に失敗", "user", uid, "name", uname, "channel", ch, "error", err)
 	}
 }
@@ -226,7 +249,8 @@ func (a *App) handleBlockActions(ctx context.Context, cb slack.InteractionCallba
 		}
 		return msgs[0], nil
 	}
-	if err := a.openModal(ctx, cb.TriggerID, v.Channel, load); err != nil {
+	// ボタンのメッセージの ts を渡し、作成後にボタンを消せるようにする
+	if err := a.openModal(ctx, cb.TriggerID, v.Channel, cb.Container.MessageTs, load); err != nil {
 		slog.Error("モーダルの表示に失敗", "user", uid, "name", uname, "channel", v.Channel, "ts", v.ThreadTS, "error", err)
 	}
 }
@@ -303,7 +327,7 @@ func noticeView(text string) slack.ModalViewRequest {
 
 // openModal はモーダルを開く。trigger_id は 3 秒で失効するため、先に読み込み中のモーダルを開き、
 // 元メッセージの取得・解析（Slack API の呼び出しを伴う）が終わってから views.update で中身を差し替える。
-func (a *App) openModal(ctx context.Context, triggerID, channel string, load func() (slack.Message, error)) error {
+func (a *App) openModal(ctx context.Context, triggerID, channel, buttonTS string, load func() (slack.Message, error)) error {
 	opened, err := a.api.OpenViewContext(ctx, triggerID, noticeView("元のメッセージを読み込んでいます…"))
 	if err != nil {
 		return fmt.Errorf("views.open: %w", err)
@@ -312,7 +336,7 @@ func (a *App) openModal(ctx context.Context, triggerID, channel string, load fun
 	view := noticeView("元のメッセージを取得できませんでした。")
 	msg, loadErr := load()
 	if loadErr == nil {
-		view = a.buildModal(ctx, channel, msg)
+		view = a.buildModal(ctx, channel, buttonTS, msg)
 	}
 	// hash を渡し、利用者が閉じた・別の更新が入ったなどで状態が変わっていれば上書きしない
 	if _, err := a.api.UpdateViewContext(ctx, view, "", opened.Hash, opened.ID); err != nil {
@@ -325,7 +349,7 @@ func (a *App) openModal(ctx context.Context, triggerID, channel string, load fun
 }
 
 // buildModal は元メッセージを解析して、入力済みのチケット作成モーダルを組み立てる。
-func (a *App) buildModal(ctx context.Context, channel string, msg slack.Message) slack.ModalViewRequest {
+func (a *App) buildModal(ctx context.Context, channel, buttonTS string, msg slack.Message) slack.ModalViewRequest {
 	im := toInquiryMessage(msg)
 	fullText, parsed := inquiry.Extract(im)
 
@@ -355,7 +379,7 @@ func (a *App) buildModal(ctx context.Context, channel string, msg slack.Message)
 	if threadTS == "" {
 		threadTS = msg.Timestamp
 	}
-	meta, _ := json.Marshal(modalMeta{Channel: channel, TS: msg.Timestamp, ThreadTS: threadTS, Author: requesterID})
+	meta, _ := json.Marshal(modalMeta{Channel: channel, TS: msg.Timestamp, ThreadTS: threadTS, Author: requesterID, ButtonTS: buttonTS})
 
 	summaryEl := slack.NewPlainTextInputBlockElement(nil, "v")
 	summaryEl.InitialValue = textutil.Truncate(textutil.OneLine(title), 255)
@@ -416,7 +440,10 @@ func (a *App) handleSubmission(ctx context.Context, cb slack.InteractionCallback
 
 	requester := fmt.Sprintf("%s (%s)", cb.User.Name, user)
 	assigneeID := a.jiraAccountID(ctx, user) // ショートカットを押した人
-	reporterID := a.jiraAccountID(ctx, meta.Author)
+	reporterID := ""
+	if a.cfg.Jira.SetReporter { // reporter を送らない設定なら、Slack・Jira への問い合わせ自体を省く
+		reporterID = a.jiraAccountID(ctx, meta.Author)
+	}
 	reporterName := ""
 	if meta.Author != "" {
 		reporterName = a.replaceMentions(ctx, "<@"+meta.Author+">")
@@ -456,6 +483,9 @@ func (a *App) handleSubmission(ctx context.Context, cb slack.InteractionCallback
 		}
 		if len(notes) > 0 {
 			text += "\n（注意: " + strings.Join(notes, " / ") + "）"
+		}
+		if meta.ButtonTS != "" {
+			a.markButtonDone(ctx, meta.Channel, meta.ButtonTS, user, key)
 		}
 	}
 
@@ -519,6 +549,19 @@ func (a *App) postCreateButton(ctx context.Context, ch, threadTS string) error {
 		slack.MsgOptionBlocks(section, slack.NewActionBlock("", btn)),
 	)
 	return err
+}
+
+// markButtonDone は「Jira チケットを作成」ボタンのメッセージを作成済みの表示に置き換え、ボタンを消す。
+// 失敗してもチケットは作成済みなのでログだけ残す。
+func (a *App) markButtonDone(ctx context.Context, ch, ts, user, key string) {
+	text := fmt.Sprintf("<@%s> が Jira チケット <%s/browse/%s|%s> を作成しました。", user, a.cfg.Jira.BaseURL, key, key)
+	_, _, _, err := a.api.UpdateMessageContext(ctx, ch, ts,
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionBlocks(), // 空の blocks を送ってボタンを消す
+	)
+	if err != nil {
+		slog.Error("作成ボタンの更新に失敗", "channel", ch, "ts", ts, "key", key, "error", err)
+	}
 }
 
 func (a *App) runTransitionCommand(ctx context.Context, uid, ch, replyTS, action, key string) {

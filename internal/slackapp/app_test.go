@@ -49,7 +49,9 @@ func (f *fakeSlack) serve(w http.ResponseWriter, r *http.Request) {
 	case "conversations.replies":
 		_, _ = w.Write([]byte(replies))
 	case "users.info":
-		_, _ = w.Write([]byte(`{"ok":true,"user":{"id":"U0REQ","name":"hanako","real_name":"花子"}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"id":"U0REQ","name":"hanako","real_name":"花子","profile":{"email":"u@example.com"}}}`))
+	case "chat.getPermalink":
+		_, _ = w.Write([]byte(`{"ok":true,"permalink":"https://slack.example/archives/C1/p111222"}`))
 	default:
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}
