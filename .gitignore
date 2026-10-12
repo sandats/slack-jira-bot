@@ -1,0 +1,5 @@
+.env
+k8s/secret.yaml
+# ビルド成果物（ルート直下のみ。cmd/slack-jira-bot/ ディレクトリを無視しないよう / を付ける）
+/slack-jira-bot
+/slack-jira-bot.exe

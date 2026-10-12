@@ -1,0 +1,5 @@
+k8s
+**/*_test.go
+.git
+.env
+*.md
