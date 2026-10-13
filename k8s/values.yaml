@@ -1,0 +1,36 @@
+# helmfile.yaml から chart（charts/slack-jira-bot）に渡す、この環境の値。
+# 指定できる項目とデフォルト値は charts/slack-jira-bot/values.yaml を参照。
+
+image:
+  repository: REGION-docker.pkg.dev/PROJECT/REPO/slack-jira-bot
+  # latest は使わない（imagePullPolicy: IfNotPresent だと古いイメージが使われ続ける）。
+  # リリースごとに変わるタグか、ダイジェスト（digest: sha256:...）を指定する
+  tag: "0.1.0"
+
+# トークン類は Google Cloud Secret Manager から External Secrets Operator で読み込む。
+# シークレットの作成と IAM の設定は README の「デプロイ手順」を参照
+externalSecret:
+  enabled: true
+  data:
+    SLACK_BOT_TOKEN: slack-jira-bot-slack-bot-token
+    SLACK_APP_TOKEN: slack-jira-bot-slack-app-token
+    JIRA_API_TOKEN: slack-jira-bot-jira-api-token
+  gcpsm:
+    projectID: PROJECT
+
+# ConfigMap に入れる環境変数（トークン類は Secret に置く）。
+# 数値や真偽値も文字列として渡すため、値は引用符で囲む
+config:
+  JIRA_BASE_URL: "https://your-domain.atlassian.net"
+  JIRA_API_BASE: "https://api.atlassian.com/ex/jira/<cloudId>"
+  JIRA_EMAIL: "service-account@example.com"
+  JIRA_PROJECT_KEY: "<projectKey>"
+  JIRA_ISSUE_TYPE_ID: "<issueTypeId>"
+  JIRA_SET_REPORTER: "0"
+  # 必須: 操作を許可する Slack ユーザー ID（カンマ区切り）。全員許可する場合は * 。未設定だと起動しません
+  ALLOWED_USER_IDS: ""
+  JIRA_CLOSE_TRANSITION_ID: ""
+  JIRA_CLOSE_RESOLUTION: ""
+  JIRA_CANCEL_TRANSITION_ID: ""
+  JIRA_CANCEL_RESOLUTION: ""
+  HTTP_ADDR: ":8080"

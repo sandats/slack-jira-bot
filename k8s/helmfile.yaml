@@ -1,0 +1,8 @@
+# 適用: helmfile -f k8s/helmfile.yaml apply（kubectl の現在のコンテキストが対象。helm-diff は `mise run setup` で入る）
+# ローカルの kind へは `mise run kind:deploy`（values-kind.yaml を重ねる）
+releases:
+  - name: slack-jira-bot
+    namespace: slack-jira-bot
+    chart: ./charts/slack-jira-bot
+    values:
+      - values.yaml

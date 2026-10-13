@@ -57,16 +57,30 @@ internal/
   jira/               Jira Cloud REST API クライアント
   slackapp/           Slack（Socket Mode）のイベント処理、モーダル
   textutil/           文字列の小さなユーティリティ
-k8s/                  kustomize 一式（Deployment 2 replicas, PDB, NetworkPolicy, ConfigMap 生成）
+k8s/                  helmfile 一式（helmfile.yaml・values.yaml と Helm chart。Deployment 2 replicas, PDB, NetworkPolicy, ConfigMap）
+                      values-kind.yaml はローカルの kind 用
 Dockerfile            distroless/nonroot の最終イメージ
+mise.toml             開発ツールのバージョンとタスク
 ```
 
 テストは Go の慣習どおり、対象と同じディレクトリに `*_test.go` として置いています。
 
 ```sh
-go test ./...                    # 全パッケージのテスト
+go test ./...                    # 全パッケージのテスト（mise run test で CI と同じ go vet・go test -race）
 go build ./cmd/slack-jira-bot    # ビルド
 ```
+
+## 開発ツール
+
+Go・Helm・helmfile・kubectl・kind は [mise](https://mise.jdx.dev/) で入れます。バージョンは [mise.toml](mise.toml) で固定しています。
+
+```sh
+mise install       # ツールを入れる
+mise run setup     # helmfile が使う Helm プラグイン（helm-diff など）を入れる
+mise tasks         # タスクの一覧
+```
+
+Secret Manager の設定に使う gcloud は mise.toml に含めていません（Python に依存し、環境によってはインストールに失敗するため）。別途インストールしてください。
 
 ## CI
 
@@ -79,7 +93,7 @@ GitHub Actions（[.github/workflows/ci.yml](.github/workflows/ci.yml)）と GitL
 
 - GitHub Actions は `main` への push・Pull Request・週 1 回の定期実行で動きます。GitLab は MR・デフォルトブランチへの push と、「Build > Pipeline schedules」で設定した定期実行で動きます。
 - 依存関係（Go モジュール・GitHub Actions・Docker のベースイメージ）は Dependabot が週 1 回更新 PR を作ります（[.github/dependabot.yml](.github/dependabot.yml)）。
-- Go のバージョンは Dockerfile・両 CI の 3 か所で指定しています（Dependabot の対象外）。上げるときはまとめて更新してください。
+- Go のバージョンは Dockerfile・両 CI・mise.toml の 4 か所で指定しています（Dependabot の対象外）。上げるときはまとめて更新してください。
 - 改行コードは [.gitattributes](.gitattributes) で LF に統一しています。
 
 ## 検証状況
@@ -156,7 +170,7 @@ Bot は、使うチャンネルに招待しておいてください（`/invite @
 | `JIRA_CLOSE_RESOLUTION` / `JIRA_CANCEL_RESOLUTION` | | 遷移時に設定する解決状況の名前 |
 | `HTTP_ADDR` | | ヘルスチェックの待ち受けアドレス（既定 `:8080`） |
 
-トークン類（`SLACK_BOT_TOKEN`・`SLACK_APP_TOKEN`・`JIRA_API_TOKEN`）は Secret に、それ以外は `k8s/config.env`（ConfigMap）に置きます。
+トークン類（`SLACK_BOT_TOKEN`・`SLACK_APP_TOKEN`・`JIRA_API_TOKEN`）は Secret に、それ以外は `k8s/values.yaml` の `config`（ConfigMap）に置きます。
 
 ## ローカルでの実行
 
@@ -171,21 +185,71 @@ go run ./cmd/slack-jira-bot
 
 本番と同じ Slack App のトークンで起動すると、イベントがローカルと本番の Pod に分散して届きます。動作確認には別の Slack App（開発用）を使ってください。
 
+### kind で動かす
+
+chart と helmfile を含めて確かめたいときは、ローカルの [kind](https://kind.sigs.k8s.io/) クラスターに適用します。Docker が必要です。
+kind では GKE の Workload Identity が使えないため External Secrets は使わず、Secret を手で作ります（[k8s/values-kind.yaml](k8s/values-kind.yaml)）。
+kind のタスクは常に `kind-slack-jira-bot` コンテキストを指定するので、現在のコンテキストが本番のクラスターでも影響しません。
+
+```sh
+cp k8s/values-kind.local.example.yaml k8s/values-kind.local.yaml  # ALLOWED_USER_IDS や Jira の設定を記入（Git にはコミットしない）
+mise run kind:up       # クラスターを作る
+mise run kind:image    # イメージをビルドして読み込む（コードを変えたら再実行。動いている Pod も作り直す）
+mise run kind:secret   # トークン類を入力して Secret を作る
+mise run kind:deploy   # helmfile で適用する
+kubectl --context kind-slack-jira-bot -n slack-jira-bot logs -f deploy/slack-jira-bot
+mise run kind:down     # 片付け
+```
+
+`kind create cluster` は kubectl の現在のコンテキストを `kind-slack-jira-bot` に切り替えます。元に戻すときは `kubectl config use-context <元のコンテキスト>` を実行してください。
+
 ## デプロイ手順
 
 1. イメージをビルドして、コンテナレジストリ（Artifact Registry など）へ push します。タグはリリースごとに変えます（`latest` は使いません）。
-2. `k8s/kustomization.yaml` の `images` を、実際のイメージとタグ（またはダイジェスト）に変更します。
-3. `k8s/config.env` を編集します。
+2. `k8s/values.yaml` の `image` を、実際のイメージとタグ（またはダイジェスト）に変更します。
+3. `k8s/values.yaml` の `config` を編集します。
    - `ALLOWED_USER_IDS` は必須です（例: `U012ABC,U034DEF`）。全員に許可する場合は `*` を明示してください。未設定のままだと設定エラーで起動しません。
-4. Secret を作成します。
+4. トークン類を Google Cloud Secret Manager に登録し、[External Secrets Operator](https://external-secrets.io/)（ESO）で読み込めるようにします。
+   - クラスターに ESO（`external-secrets.io/v1`）をインストールし、GKE の Workload Identity を有効にしておきます。
+   - `k8s/values.yaml` の `externalSecret.gcpsm.projectID` を、Secret Manager のあるプロジェクトに変更します。
+   - シークレット名を変える場合は `externalSecret.data` も合わせます。既存の ClusterSecretStore を使う場合は `externalSecret.secretStoreRef` を指定します。
 
    ```sh
-   kubectl create ns slack-jira-bot
-   cp k8s/secret.example.yaml k8s/secret.yaml  # 値を記入（Git にはコミットしない）
-   kubectl apply -f k8s/secret.yaml
+   PROJECT_ID=<project-id>
+   PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
+   # ESO が使う ServiceAccount（chart が作る slack-jira-bot/slack-jira-bot-secrets）のプリンシパル
+   MEMBER=principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$PROJECT_ID.svc.id.goog/subject/ns/slack-jira-bot/sa/slack-jira-bot-secrets
+
+   for name in slack-bot-token slack-app-token jira-api-token; do
+     gcloud secrets create slack-jira-bot-$name --project $PROJECT_ID --replication-policy automatic
+     gcloud secrets add-iam-policy-binding slack-jira-bot-$name --project $PROJECT_ID \
+       --role roles/secretmanager.secretAccessor --member $MEMBER
+   done
+
+   # 値を登録（シェルの履歴に残さず、末尾に改行も入らないよう read で受け取って渡す）
+   for name in slack-bot-token slack-app-token jira-api-token; do
+     printf '%s: ' $name; read -rs value; echo
+     printf '%s' "$value" | gcloud secrets versions add slack-jira-bot-$name --project $PROJECT_ID --data-file -
+   done
    ```
 
-5. `kubectl apply -k k8s` で適用します。
+   IAM サービスアカウントの権限を借用する方式にしたい場合は、そのサービスアカウントに権限を付与し、`externalSecret.gcpsm.gcpServiceAccount` にメールアドレスを指定します。
+   Secret Manager の値を更新したときは、Secret への反映（`refreshInterval`、既定 1 時間）を待ってから `kubectl -n slack-jira-bot rollout restart deploy/slack-jira-bot` で Pod を作り直してください（環境変数は起動時にしか読まれません）。
+
+5. helmfile で適用します。対象は kubectl の現在のコンテキストです。`diff`・`apply` には helm-diff プラグインが必要です（`mise run setup` で入ります）。
+
+   ```sh
+   helmfile -f k8s/helmfile.yaml diff   # 変更内容の確認
+   helmfile -f k8s/helmfile.yaml apply
+   ```
+
+   初回は Secret が作られるまで Pod が `CreateContainerConfigError` になることがありますが、作られると自動で起動します。
+
+   以前 `kubectl apply -k k8s` で適用した環境では、既存リソースが Helm の管理外のため `apply` が失敗します。
+   `kubectl delete -k`（旧構成のチェックアウトで実行。Namespace ごと Secret も消えるので注意）で消してから適用するか、
+   既存リソースに `meta.helm.sh/release-name=slack-jira-bot`・`meta.helm.sh/release-namespace=slack-jira-bot` アノテーションと
+   `app.kubernetes.io/managed-by=Helm` ラベルを付けて Helm に引き継いでください。
+   手動で作った Secret（`slack-jira-bot`）が残っている場合は、ESO が管理できるよう削除しておいてください。
 
 ## 通信要件
 Egress 443 で `slack.com` / `*.slack.com`（WebSocket 含む）/ `api.atlassian.com` に到達できること。Ingress は不要です。

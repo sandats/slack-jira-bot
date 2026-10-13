@@ -1,0 +1,10 @@
+# コピーして values-kind.local.yaml を作り、値を入れる（Git にはコミットしない）。
+#   cp k8s/values-kind.local.example.yaml k8s/values-kind.local.yaml
+# 本番と同じ Slack App を使うとイベントが本番と kind に分散するため、開発用の Slack App・Jira プロジェクトを使う
+config:
+  ALLOWED_USER_IDS: "U012ABC"
+  JIRA_BASE_URL: "https://your-domain.atlassian.net"
+  JIRA_API_BASE: "https://api.atlassian.com/ex/jira/<cloudId>"
+  JIRA_EMAIL: "you@example.com"
+  JIRA_PROJECT_KEY: "<projectKey>"
+  JIRA_ISSUE_TYPE_ID: "<issueTypeId>"

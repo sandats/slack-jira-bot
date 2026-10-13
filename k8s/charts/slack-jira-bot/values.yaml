@@ -1,0 +1,45 @@
+# chart のデフォルト値。環境ごとの値は k8s/values.yaml（helmfile から渡す）で上書きする。
+
+replicaCount: 2   # Socket Mode は各 Pod が接続し、イベントはどれか 1 つに配送される
+
+image:
+  repository: REGION-docker.pkg.dev/PROJECT/REPO/slack-jira-bot
+  # latest は使わない（imagePullPolicy: IfNotPresent だと古いイメージが使われ続ける）。
+  # リリースごとに変わるタグか、ダイジェスト（digest: sha256:...）を指定する。
+  # 空なら Chart.yaml の appVersion を使う。digest を指定すると tag より優先される
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# トークン類（SLACK_BOT_TOKEN・SLACK_APP_TOKEN・JIRA_API_TOKEN）を入れた Secret の名前。
+# externalSecret.enabled が false なら、この名前の Secret を別途作っておく
+secretName: slack-jira-bot
+
+# External Secrets Operator（ESO）で Google Cloud Secret Manager から secretName の Secret を作る。
+# ESO（external-secrets.io/v1）がクラスターに入っていること
+externalSecret:
+  enabled: false
+  # Secret Manager の値を読み直す間隔。Secret が更新されても Pod の環境変数は変わらないので、
+  # ローテーション後は Pod の再起動（kubectl rollout restart）が必要
+  refreshInterval: 1h
+  # キー: 環境変数名、値: Secret Manager のシークレット名（latest バージョンを読む）
+  data: {}
+  # 既存の SecretStore / ClusterSecretStore を使う場合に指定する（例: { kind: ClusterSecretStore, name: gcp-secret-manager }）。
+  # 空なら下の gcpsm の設定で、この namespace に SecretStore と ESO 用の ServiceAccount を作る
+  secretStoreRef: {}
+  gcpsm:
+    projectID: ""   # Secret Manager のあるプロジェクト ID（SecretStore を作る場合は必須）
+    # Workload Identity の設定。空なら ESO が GKE のメタデータサーバーから取得する
+    clusterLocation: ""
+    clusterName: ""
+    clusterProjectID: ""
+    # IAM サービスアカウントの権限を借用する場合に指定（iam.gke.io/gcp-service-account アノテーションを付ける）。
+    # 空なら Workload Identity Federation で、ESO 用 ServiceAccount のプリンシパルに直接権限を付与する
+    gcpServiceAccount: ""
+
+# ConfigMap に入れる環境変数。値はすべて文字列として扱う
+config: {}
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 128Mi }

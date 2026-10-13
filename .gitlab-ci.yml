@@ -13,7 +13,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "schedule"
 
 default:
-  # Go を上げるときは Dockerfile のベースイメージ・GitHub Actions の go-version と合わせて更新する
+  # Go を上げるときは Dockerfile のベースイメージ・GitHub Actions の go-version・mise.toml と合わせて更新する
   # （trixie の通常イメージには、go test -race に必要な gcc が入っている）
   image: golang:1.27-trixie
   interruptible: true
