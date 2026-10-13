@@ -58,15 +58,29 @@ internal/
   slackapp/           Slack（Socket Mode）のイベント処理、モーダル
   textutil/           文字列の小さなユーティリティ
 k8s/                  helmfile 一式（helmfile.yaml・values.yaml と Helm chart。Deployment 2 replicas, PDB, NetworkPolicy, ConfigMap）
+                      values-kind.yaml はローカルの kind 用
 Dockerfile            distroless/nonroot の最終イメージ
+mise.toml             開発ツールのバージョンとタスク
 ```
 
 テストは Go の慣習どおり、対象と同じディレクトリに `*_test.go` として置いています。
 
 ```sh
-go test ./...                    # 全パッケージのテスト
+go test ./...                    # 全パッケージのテスト（mise run test で CI と同じ go vet・go test -race）
 go build ./cmd/slack-jira-bot    # ビルド
 ```
+
+## 開発ツール
+
+Go・Helm・helmfile・kubectl・kind は [mise](https://mise.jdx.dev/) で入れます。バージョンは [mise.toml](mise.toml) で固定しています。
+
+```sh
+mise install       # ツールを入れる
+mise run setup     # helmfile が使う Helm プラグイン（helm-diff など）を入れる
+mise tasks         # タスクの一覧
+```
+
+Secret Manager の設定に使う gcloud は mise.toml に含めていません（Python に依存し、環境によってはインストールに失敗するため）。別途インストールしてください。
 
 ## CI
 
@@ -79,7 +93,7 @@ GitHub Actions（[.github/workflows/ci.yml](.github/workflows/ci.yml)）と GitL
 
 - GitHub Actions は `main` への push・Pull Request・週 1 回の定期実行で動きます。GitLab は MR・デフォルトブランチへの push と、「Build > Pipeline schedules」で設定した定期実行で動きます。
 - 依存関係（Go モジュール・GitHub Actions・Docker のベースイメージ）は Dependabot が週 1 回更新 PR を作ります（[.github/dependabot.yml](.github/dependabot.yml)）。
-- Go のバージョンは Dockerfile・両 CI の 3 か所で指定しています（Dependabot の対象外）。上げるときはまとめて更新してください。
+- Go のバージョンは Dockerfile・両 CI・mise.toml の 4 か所で指定しています（Dependabot の対象外）。上げるときはまとめて更新してください。
 - 改行コードは [.gitattributes](.gitattributes) で LF に統一しています。
 
 ## 検証状況
@@ -171,6 +185,24 @@ go run ./cmd/slack-jira-bot
 
 本番と同じ Slack App のトークンで起動すると、イベントがローカルと本番の Pod に分散して届きます。動作確認には別の Slack App（開発用）を使ってください。
 
+### kind で動かす
+
+chart と helmfile を含めて確かめたいときは、ローカルの [kind](https://kind.sigs.k8s.io/) クラスターに適用します。Docker が必要です。
+kind では GKE の Workload Identity が使えないため External Secrets は使わず、Secret を手で作ります（[k8s/values-kind.yaml](k8s/values-kind.yaml)）。
+kind のタスクは常に `kind-slack-jira-bot` コンテキストを指定するので、現在のコンテキストが本番のクラスターでも影響しません。
+
+```sh
+cp k8s/values-kind.local.example.yaml k8s/values-kind.local.yaml  # ALLOWED_USER_IDS や Jira の設定を記入（Git にはコミットしない）
+mise run kind:up       # クラスターを作る
+mise run kind:image    # イメージをビルドして読み込む（コードを変えたら再実行。動いている Pod も作り直す）
+mise run kind:secret   # トークン類を入力して Secret を作る
+mise run kind:deploy   # helmfile で適用する
+kubectl --context kind-slack-jira-bot -n slack-jira-bot logs -f deploy/slack-jira-bot
+mise run kind:down     # 片付け
+```
+
+`kind create cluster` は kubectl の現在のコンテキストを `kind-slack-jira-bot` に切り替えます。元に戻すときは `kubectl config use-context <元のコンテキスト>` を実行してください。
+
 ## デプロイ手順
 
 1. イメージをビルドして、コンテナレジストリ（Artifact Registry など）へ push します。タグはリリースごとに変えます（`latest` は使いません）。
@@ -204,7 +236,7 @@ go run ./cmd/slack-jira-bot
    IAM サービスアカウントの権限を借用する方式にしたい場合は、そのサービスアカウントに権限を付与し、`externalSecret.gcpsm.gcpServiceAccount` にメールアドレスを指定します。
    Secret Manager の値を更新したときは、Secret への反映（`refreshInterval`、既定 1 時間）を待ってから `kubectl -n slack-jira-bot rollout restart deploy/slack-jira-bot` で Pod を作り直してください（環境変数は起動時にしか読まれません）。
 
-5. [helmfile](https://github.com/helmfile/helmfile) で適用します。`diff`・`apply` には [helm-diff](https://github.com/databus23/helm-diff) プラグインが必要です（無い場合は `sync`）。
+5. helmfile で適用します。対象は kubectl の現在のコンテキストです。`diff`・`apply` には helm-diff プラグインが必要です（`mise run setup` で入ります）。
 
    ```sh
    helmfile -f k8s/helmfile.yaml diff   # 変更内容の確認

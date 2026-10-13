@@ -1,0 +1,73 @@
+# このリポジトリで使うツールとタスク。`mise install` でツールが入り、`mise tasks` でタスクを一覧できる。
+# Go を上げるときは Dockerfile のベースイメージ・両 CI の Go のバージョンと揃える
+[tools]
+go = "1.27"
+helm = "4.3"
+helmfile = "1.8"
+kubectl = "1.37"
+kind = "0.33"
+
+[vars]
+kind_cluster = "slack-jira-bot"
+
+[tasks.setup]
+description = "helmfile が使う Helm プラグイン（helm-diff など）を入れる"
+run = "helmfile init --force"
+
+[tasks.test]
+description = "CI と同じ go vet・go test を実行する"
+run = ["go vet ./...", "go test -race ./..."]
+
+[tasks."chart:lint"]
+description = "Helm chart を lint する"
+run = "helm lint k8s/charts/slack-jira-bot -f k8s/values.yaml --strict"
+
+# ---- ローカルの kind で動かす ----
+# kind のタスクはすべて kind のコンテキストを明示し、現在のコンテキスト（本番など）には触らない
+
+[tasks."kind:up"]
+description = "kind クラスターを作る（作成済みなら何もしない）"
+run = "kind get clusters | grep -qx {{vars.kind_cluster}} || kind create cluster --name {{vars.kind_cluster}}"
+
+[tasks."kind:image"]
+description = "イメージをビルドして kind に読み込み、動いている Pod を作り直す"
+run = """
+docker build -t slack-jira-bot:dev .
+kind load docker-image slack-jira-bot:dev --name {{vars.kind_cluster}}
+if kubectl --context kind-{{vars.kind_cluster}} -n slack-jira-bot get deploy/slack-jira-bot >/dev/null 2>&1; then
+  kubectl --context kind-{{vars.kind_cluster}} -n slack-jira-bot rollout restart deploy/slack-jira-bot
+fi
+"""
+
+[tasks."kind:secret"]
+description = "トークン類を入力して Secret を作る（作成済みなら上書き）"
+raw = true   # 入力を受け付けるため
+shell = "bash -c"
+run = """
+set -euo pipefail
+ctx=kind-{{vars.kind_cluster}}
+kubectl --context $ctx create namespace slack-jira-bot --dry-run=client -o yaml | kubectl --context $ctx apply -f -
+read -rsp 'SLACK_BOT_TOKEN: ' bot; echo
+read -rsp 'SLACK_APP_TOKEN: ' app; echo
+read -rsp 'JIRA_API_TOKEN: ' jira; echo
+# トークンをコマンドライン引数に載せない（ps で見えるため）
+kubectl --context $ctx -n slack-jira-bot create secret generic slack-jira-bot --dry-run=client -o yaml \
+  --from-env-file=<(printf 'SLACK_BOT_TOKEN=%s\\nSLACK_APP_TOKEN=%s\\nJIRA_API_TOKEN=%s\\n' "$bot" "$app" "$jira") |
+  kubectl --context $ctx apply -f -
+"""
+
+[tasks."kind:deploy"]
+description = "helmfile で kind に適用する"
+run = """
+if [ ! -f k8s/values-kind.local.yaml ]; then
+  echo 'k8s/values-kind.local.yaml がありません。k8s/values-kind.local.example.yaml をコピーして作ってください' >&2
+  exit 1
+fi
+# --values のパスは helmfile.yaml のあるディレクトリ（k8s/）が基準
+helmfile -f k8s/helmfile.yaml --kube-context kind-{{vars.kind_cluster}} apply \
+  --values values-kind.yaml --values values-kind.local.yaml
+"""
+
+[tasks."kind:down"]
+description = "kind クラスターを削除する"
+run = "kind delete cluster --name {{vars.kind_cluster}}"

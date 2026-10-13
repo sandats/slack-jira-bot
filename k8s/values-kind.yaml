@@ -1,0 +1,14 @@
+# ローカルの kind で動かすときに、values.yaml に重ねる値（`mise run kind:deploy` が渡す）。
+# 個人の設定（ALLOWED_USER_IDS や Jira の設定）は values-kind.local.yaml に書く
+
+replicaCount: 1
+
+# `mise run kind:image` でビルドして kind に読み込んだイメージ
+image:
+  repository: slack-jira-bot
+  tag: dev
+
+# kind では GKE の Workload Identity が使えないため、ESO は使わない。
+# Secret は `mise run kind:secret` で作る
+externalSecret:
+  enabled: false

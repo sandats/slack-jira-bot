@@ -1,4 +1,5 @@
-# 適用: helmfile -f k8s/helmfile.yaml apply（helm-diff プラグインが必要。無ければ sync）
+# 適用: helmfile -f k8s/helmfile.yaml apply（kubectl の現在のコンテキストが対象。helm-diff は `mise run setup` で入る）
+# ローカルの kind へは `mise run kind:deploy`（values-kind.yaml を重ねる）
 releases:
   - name: slack-jira-bot
     namespace: slack-jira-bot
